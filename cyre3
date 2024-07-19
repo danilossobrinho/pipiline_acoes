@@ -1,0 +1,120 @@
+# Bibliotecas necessárias
+import yfinance as yf
+import sqlalchemy
+import pandas as pd
+import psycopg2
+import datetime
+from prophet import Prophet
+from sqlalchemy import (String, Integer, Column, Table, MetaData)
+
+from sqlalchemy import create_engine, Column, Integer, Float, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+###################################################################
+
+# Acessando o banco de dados novamente
+conexao = psycopg2.connect(
+    database='postgres',
+    host='localhost',
+    user='postgres',
+    password='postgres',
+    port='2222',
+    options=f'-c search_path=acoes')
+
+cursor = conexao.cursor()
+query1 = 'select max("Date") from acoes.carteirinha '
+ultimadata = pd.read_sql(query1, conexao)
+ultimadata = ultimadata['max'].iloc[0]
+
+###################################################################
+
+# Ações de interesse
+codigos = ["MRVE3.SA","CYRE3.SA", "MULT3.SA"]
+hoje = datetime.date.today()
+hoje = hoje.strftime('%Y-%m-%d')
+carteira_hoje = yf.download(codigos, start= ultimadata, end= hoje)['Adj Close'] #SCRIPT ATUALIZADOR
+
+##################################################################
+
+# Conectando ao banco POSTGRES
+usuario = 'postgres'
+senha = 'postgres'
+host = 'localhost'
+porta = '2222'
+nome_do_banco = 'postgres'
+
+conexao_str = f'postgresql+psycopg2://{usuario}:{senha}@{host}:{porta}/{nome_do_banco}'
+engine = sqlalchemy.create_engine(conexao_str, echo = True)
+
+esquema = 'acoes'
+nome_da_tabela = 'carteirinha'
+
+# Tratamento dos dados
+carteira_hoje['Date'] = carteira_hoje.index
+carteira_hoje['Date'] = pd.to_datetime(carteira_hoje['Date'])
+carteira_hoje['Date'] = carteira_hoje['Date'].dt.strftime('%Y-%m-%d')
+carteira_hoje = carteira_hoje[['Date', 'CYRE3.SA', 'MRVE3.SA', 'MULT3.SA']]
+
+# Carregar os dados para a tabela do PostgreSQL
+carteira_hoje.to_sql(nome_da_tabela, engine, if_exists='append', index=False, schema = esquema)
+
+#################################################################
+
+#Puxar a base toda, atualizada
+query2 = 'select * from carteirinha'
+carteirinha = pd.read_sql(query2, conexao)
+
+#################################################################
+
+carteirinha_cyre3 = (carteirinha.drop(columns=['MRVE3.SA', 'MULT3.SA'])
+                    .rename(columns={'Date': 'ds', 'CYRE3.SA': 'y'})
+                    .assign(ds=lambda x: pd.to_datetime(x['ds']),
+                            y=lambda x: round(x['y'], 2))
+                    .sort_values('ds')
+                    .reset_index(drop=True))
+
+#################################################################
+
+# Criar uma DataFrame com as datas completas no intervalo desejado
+date_range = pd.date_range(start=carteirinha_cyre3['ds'].min(), end=carteirinha_cyre3['ds'].max())
+# Criar um DataFrame com todas as datas no intervalo
+full_dates = pd.DataFrame(date_range, columns=['ds'])
+# Fazer o merge para garantir que todas as datas estejam presentes
+carteirinha_cyre3 = pd.merge(full_dates, carteirinha_cyre3, on='ds', how='left')
+# Preencher os valores faltantes com o último valor disponível
+carteirinha_cyre3['y'] = carteirinha_cyre3['y'].fillna(method='ffill')
+
+################################################################
+
+# Rodando em modelo de forcast do Prophet
+m = Prophet()
+m.fit(carteirinha_cyre3)
+
+futuro = m.make_future_dataframe(periods=90)
+forecast = m.predict(futuro)
+volta_banco = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+volta_banco.info()
+m.plot(forecast)
+
+# Python
+fig2 = m.plot_components(forecast)
+
+################################################################
+
+Base = declarative_base()
+
+class VoltaBanco(Base):
+    __tablename__ = 'volta_banco'
+
+    id = Column(Integer, primary_key=True)
+    ds = Column(DateTime)
+    yhat = Column(Float)
+    yhat_lower = Column(Float)
+    yhat_upper = Column(Float)
+
+# Cria a tabela no banco de dados, se ainda não existir
+Base.metadata.create_all(engine)
+
+# Converte o DataFrame para o formato compatível com a tabela
+volta_banco.to_sql('volta_banco', con=engine, if_exists='append', index=False)
